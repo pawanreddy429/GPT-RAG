@@ -2,6 +2,9 @@
 
 This document outlines the steps to set up a multi-environment workflow to deploy infrastructure and services to Azure using GitHub Actions, taking the solution from proof of concept to production-ready.
 
+> [!NOTE]
+> Note that additional steps may be required when working with the Zero Trust Architecture Deployment to handle deploying to a network-isolated environment. This guide is currently focused on deploying the Basic Architecture Deployment.
+
 # Assumptions:
 
 - This example assumes you're using a GitHub organization with GitHub environments
@@ -28,14 +31,17 @@ This document outlines the steps to set up a multi-environment workflow to deplo
 - [PowerShell 7](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell?view=powershell-7.4)
 - [Git](https://git-scm.com/downloads)
 - Bash shell (e.g., Git Bash)
-- GitHub organization with ability to provision environments (e.g., GitHub Enterprise)
-- Personnel with Azure admin (can create Service Principals) and GitHub admin (owns repository/organization) access
-- The code in the repository needs to exist in Azure Repos and you need to have it cloned locally. [This guide](https://github.com/Azure/azure-dev/blob/main/cli/azd/docs/manual-pipeline-config.md) may be useful if you run into issues setting up your repository.
+- GitHub organization with the [ability to provision environments](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment) (e.g., GitHub Enterprise)
+- Personnel with the following access levels:
+  - In Azure: Either Owner role or Contributor + User Access Administrator roles within the Azure subscription, which provides the ability to create and assign roles to a Service Principal
+  - In GitHub: Repository owner access, which provides the ability to create environments and variables/secrets
+- The repository/respositories are cloned to your local machine
 
 # Steps:
 
 > [!NOTE]
-> All commands below are to be run in a Bash shell.
+> 1. All commands below are to be run in a Bash shell.
+> 2. This guide aims to provide automated/programmatic steps for pipeline setup where possible. Manual setup is also possible, but not covered extensively in this guide. Please read more about manual pipeline setup [here](https://github.com/Azure/azure-dev/blob/main/cli/azd/docs/manual-pipeline-config.md).
 
 ## 1. Create azd environments & Service Principals
 
@@ -61,7 +67,10 @@ prod_principal_name='<prod-sp-name>'
 
 Next, you will create an `azd` environment per target environment alongside a pipeline definition. In this guide, pipeline definitions are created with `azd pipeline config`. Read more about azd pipeline config [here](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/configure-devops-pipeline?tabs=azdo). View the CLI documentation [here](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/reference#azd-pipeline-config).
 
-For each below environment, when running `azd pipeline config` for each environment, choose **GitHub** as the provider, choose your target Azure subscription, and Azure location. When prompted to commit and push your local changes to start the configured CI pipeline, say 'N'.
+For each below environment, when running `azd pipeline config` for each environment, choose your target Azure subscription and Azure location. When prompted to commit and push your local changes to start the configured CI pipeline, enter 'N'.
+
+> [!CAUTION]
+> If you choose 'Y' to commit and push your local changes, the pipeline will be triggered, and you may not have the necessary environments or variables set up yet, causing the pipeline to fail. The remaining setup steps must be completed before the pipeline will run successfully.
 
 Login to Azure:
 
@@ -73,21 +82,21 @@ az login
 
 ```bash
 azd env new $dev_env
-azd pipeline config --auth-type federated --principal-name $dev_principal_name
+azd pipeline config --auth-type federated --principal-name $dev_principal_name --provider github
 ```
 
 #### Test
 
 ```bash
 azd env new $test_env
-azd pipeline config --auth-type federated --principal-name $test_principal_name
+azd pipeline config --auth-type federated --principal-name $test_principal_name --provider github
 ```
 
 #### Prod
 
 ```bash
 azd env new $prod_env
-azd pipeline config --auth-type federated --principal-name $prod_principal_name
+azd pipeline config --auth-type federated --principal-name $prod_principal_name --provider github
 ```
 
 > [!NOTE]
@@ -131,6 +140,9 @@ gh api --method PUT -H "Accept: application/vnd.github+json" repos/$org/$repo/en
 
 Configure the repository and environment variables: Delete the `AZURE_CLIENT_ID` and `AZURE_ENV_NAME` variables at the repository level as they aren't needed and only represent what was set for the environment you created last. `AZURE_CLIENT_ID` will be reconfigured at the environment level, and `AZURE_ENV_NAME` will be passed as an input to the deploy job.
 
+> [!IMPORTANT]
+> At a minimum, the `AZURE_CLIENT_ID` variable must be set at the environment level for each environment. If you would like to set up additional variables at the environment level, you may do so by using an approach similar to the one described in this section. For example, if you want to use a different subscription for each environment, `AZURE_SUBSCRIPTION_ID` should be deleted at the repository level and recreated at the environment level. If you want to use a different location for each environment, `AZURE_LOCATION` should be deleted at the repository level and recreated at the environment level.
+
 ```bash
 gh variable delete AZURE_CLIENT_ID
 gh variable delete AZURE_ENV_NAME
@@ -144,16 +156,19 @@ test_client_id=$(az ad sp list --display-name $test_principal_name --query "[].a
 prod_client_id=$(az ad sp list --display-name $prod_principal_name --query "[].appId" --output tsv)
 ```
 
-> [!NOTE] 
+> [!TIP]
+> Verify that the variables are set by printing them out with `echo $<env>_client_id`.
+
+> [!NOTE]
 > _Alternative approach to get the client IDs in the above steps:_
 > In the event that there are multiple Service Principals containing the same name, the `az ad sp list` command executed above may not pull the correct ID. You may execute an alternate command to manually review the list of Service Principals by name and ID. The command to do this is exemplified below for the dev environment.
 >
 > ```bash
-> az ad sp list --display-name $dev_principal_name --query "[].{DisplayName:displayName, > AppId:appId}" --output table # return results in a table format
+> az ad sp list --display-name $dev_principal_name --query "[].{DisplayName:displayName, AppId:appId}" --output table # return results in a table format
 > dev_client_id='<guid>' # manually assign the correct client ID
 > ```
 >
-> Also note you may also get the client IDs from the Azure Portal.
+> Also note you may get the client IDs from the Azure Portal.
 
 Set these values as variables at the environment level:
 
@@ -164,7 +179,7 @@ gh variable set AZURE_CLIENT_ID -b $prod_client_id -e $prod_env
 ```
 
 > [!TIP]
-> After environments are created, consider setting up deployment protection rules for each environment. See [this article](https://docs.github.com/en/actions/administering-github-actions/managing-environments-for-deployment#deployment-protection-rules) for more.
+> After environments are created, set up deployment protection rules for each environment. See [this article](https://docs.github.com/en/actions/administering-github-actions/managing-environments-for-deployment#deployment-protection-rules) for more. While approvers are not always necessary on the development environment, they are crucial for all other environments.
 
 > [!NOTE]
 > If you want to manage and authenticate with a client secret rather than using federated identity, you would need to create a secret for each Service Principal, store it as an environment secret in GitHub, and modify the workflow to use the secret for authentication. This is not covered in this example. If you choose to use a client secret, you may skip 3.
@@ -194,12 +209,21 @@ rm federated_id.json # clean up temp file
 
 ## 4. Modify the workflow files as needed for deployment
 
+> [!IMPORTANT]
+> - The environment names in the below described `azure-dev.yml` **need to be edited to match the environment names you created**. In the file, these values are passed into the template as the `AZURE_ENV_NAME`, with a comment stating `edit to match the name of your environment`. _If you don't edit these values, the workflow will not work properly_.
+> - The `workflow_dispatch` in the `azure-dev.yml` file is set to trigger on push to a branch `none`. You may modify this to trigger on a specific branch or event.
+
 - The following files in the `.github/workflows` folder are used to deploy the infrastructure and services to Azure:
   - `azure-dev.yml`
-    - This is the main file that triggers the deployment workflow. The environment names are passed as inputs to the deploy job, **which needs to be edited to match the environment names you created**.
-    - You may edit the workflow_dispatch to suit your workflow trigger needs.
+    - This is the main file that triggers the deployment workflow. The environment names are passed as inputs to the deploy job.
   - `deploy-template.yml`
     - This is a template file invoked by `azure-dev.yml` that is used to deploy the infrastructure and services to Azure. This file needs to be edited if you are using client secret authentication.
+
+## 5. Customization for your Enterprise
+
+This end-to-end DevOps guide serves as a proof of concept of how to deploy your code to multiple environments and promote your code into production rapidly, just as the core RAG solution in this guide is intended to prove an end-to-end architecture with a frontend, orchestrator, and data ingestion service.
+
+In the case of both this DevOps guide and the core RAG solution, you will likely want to customize the code and workflows to fit your enterprise's specific needs. For example, you may want to add additional tests, security checks, or other steps to the workflow. You may also have a different Git branching or deployment strategy that necessitates changes to the workflows. From a design perspective, you may choose to modularize the the workflows differently, or inject naming conventions or other enterprise-specific standards.
 
 # Additional Resources:
 
